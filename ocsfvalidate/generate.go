@@ -21,7 +21,7 @@ import (
 )
 
 func main() {
-	versions := []string{"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"}
+	versions := []string{"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.8"}
 
 	for _, version := range versions {
 		classlist := fmt.Sprintf(
@@ -41,10 +41,40 @@ func main() {
 			log.Fatalf("parsing schema-class-list.json: %w", err)
 			return
 		}
+		// The 1.8 class list also contains abstract classes without a UID.
+		// These cannot represent events and the schema server does not expose them.
+		var classes map[string]struct {
+			UID int `json:"uid"`
+		}
+		if version == "1.8" {
+			data, err := os.ReadFile("../schema/v1.8-schema.json")
+			if err != nil {
+				log.Fatal(err)
+			}
+			var snapshot struct {
+				Classes map[string]struct {
+					UID int `json:"uid"`
+				} `json:"classes"`
+			}
+			if err := json.Unmarshal(data, &snapshot); err != nil {
+				log.Fatal(err)
+			}
+			classes = snapshot.Classes
+		}
 		for _, v := range cl {
 			vv := v.([]interface{})
 			for _, vvx := range vv {
 				className := vvx.(string)
+				if classes != nil {
+					class, ok := classes[className]
+					if !ok {
+						log.Fatalf("class %s missing from snapshot", className)
+					}
+					if class.UID == 0 {
+						log.Printf("skipping abstract class %s", className)
+						continue
+					}
+				}
 				err = fetchSchema(className, version)
 				if err != nil {
 					log.Fatalf("failed fetching %s: %w", className, err)
@@ -81,6 +111,21 @@ func fetchSchema(className string, version string) error {
 		}.Encode(),
 	}
 
+	if base := os.Getenv("OCSF_SCHEMA_BASE_URL"); base != "" {
+		baseURL, err := url.Parse(base)
+		if err != nil {
+			return fmt.Errorf("invalid OCSF_SCHEMA_BASE_URL: %w", err)
+		}
+		ux.Scheme, ux.Host = baseURL.Scheme, baseURL.Host
+		ux.Path = path.Join(baseURL.Path, "classes", className)
+	}
+	// Windows classes live under the server's extension namespace in 1.8.
+	if version == "1.8" {
+		switch className {
+		case "registry_key_query", "registry_value_activity", "registry_key_activity", "prefetch_query", "windows_service_activity", "windows_resource_activity", "registry_value_query":
+			ux.Path = path.Join(path.Dir(ux.Path), "win", className)
+		}
+	}
 	log.Printf("fetching %s/%s from %s", className, version, ux.String())
 
 	// 	https://schema.ocsf.io/schema/1.2.0/classes/web_resources_activity?profiles=
@@ -106,7 +151,22 @@ func fetchSchema(className string, version string) error {
 	}
 	startTime := time.Now()
 	req.Header.Set("User-Agent", "ocsf-schema-golang/fetch-schema")
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 20 * time.Second}
+	var resp *http.Response
+	for attempt := 0; attempt < 3; attempt++ {
+		resp, err = client.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if err == nil {
+			err = fmt.Errorf("HTTP status %s", resp.Status)
+			resp.Body.Close()
+		}
+		if attempt < 2 {
+			log.Printf("fetch failed: %v; retrying", err)
+			time.Sleep(time.Duration(1<<attempt) * time.Second)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("fetchSchema: http fetch failed: %w", err)
 	}
